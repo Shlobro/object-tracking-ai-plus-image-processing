@@ -322,11 +322,21 @@ class BottleTracker:
                 end_pt = tuple(map(int, end_pt))
                 cv2.line(vis, pt, end_pt, (0, 255, 255), 1)
 
-        # Draw estimated center
+        # Draw estimated center as a see-through crosshair
         if estimated_center is not None:
             est_pt = tuple(map(int, estimated_center))
-            cv2.circle(vis, est_pt, 12, (255, 0, 255), 3)
-            cv2.circle(vis, est_pt, 15, (255, 0, 255), 2)
+            crosshair_size = 20
+            # Draw crosshair lines (horizontal and vertical)
+            cv2.line(vis, (est_pt[0] - crosshair_size, est_pt[1]),
+                    (est_pt[0] + crosshair_size, est_pt[1]), (255, 0, 255), 2)
+            cv2.line(vis, (est_pt[0], est_pt[1] - crosshair_size),
+                    (est_pt[0], est_pt[1] + crosshair_size), (255, 0, 255), 2)
+            # Small gap in center to see through - redraw center area with thinner line
+            gap = 5
+            cv2.line(vis, (est_pt[0] - gap, est_pt[1]),
+                    (est_pt[0] + gap, est_pt[1]), (255, 0, 255), 1)
+            cv2.line(vis, (est_pt[0], est_pt[1] - gap),
+                    (est_pt[0], est_pt[1] + gap), (255, 0, 255), 1)
             cv2.putText(vis, "EST", (est_pt[0] + 20, est_pt[1]),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
 

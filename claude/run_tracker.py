@@ -273,7 +273,7 @@ class FeatureBasedTracker:
         self.last_center = center
         return center
 
-    def process_frame(self, frame):
+    def process_frame(self, frame, update_features_with_yolo=False):
         self.frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -322,6 +322,17 @@ class FeatureBasedTracker:
             # Try to add new features if we're running low
             if feature_center is not None and len(self.tracked_points) < self.num_features // 3:
                 self.add_new_features(gray, feature_center)
+
+            # Update feature point directions/distances based on YOLO when available
+            if update_features_with_yolo and yolo_center is not None:
+                yolo_center_arr = np.array(yolo_center)
+                for p in self.tracked_points:
+                    if p['active']:
+                        direction = yolo_center_arr - p['point']
+                        dist = np.linalg.norm(direction)
+                        if dist > 10:
+                            p['direction'] = direction / dist
+                            p['distance'] = dist
 
         self.prev_gray = gray.copy()
 
@@ -446,7 +457,44 @@ def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale):
     return vis
 
 
-def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_paused, speed_multiplier, display_width, view_mode):
+def draw_hybrid_view(frame, feature_center, yolo_center, scale):
+    """
+    Draw hybrid view with single dot that switches between YOLO and feature-based.
+    - Green dot + "YOLO" label when YOLO detection available
+    - Orange dot + "TRACKING" label when using feature-based fallback
+    Returns: (visualization, using_yolo boolean)
+    """
+    vis = frame.copy()
+    line_thick = max(2, int(3 * scale))
+    pt_radius = max(8, int(12 * scale))
+    cross_size = max(20, int(30 * scale))
+
+    using_yolo = yolo_center is not None
+
+    if using_yolo:
+        # Use YOLO position - green
+        center = tuple(map(int, yolo_center))
+        color = (0, 255, 0)  # Green
+    elif feature_center is not None:
+        # Use feature-based position - orange
+        center = tuple(map(int, feature_center))
+        color = (0, 165, 255)  # Orange
+    else:
+        # No position available
+        return vis, False
+
+    # Draw filled circle with white outline
+    cv2.circle(vis, center, pt_radius, color, -1)
+    cv2.circle(vis, center, pt_radius + 2, (255, 255, 255), line_thick)
+
+    # Draw crosshairs
+    cv2.line(vis, (center[0] - cross_size, center[1]), (center[0] + cross_size, center[1]), color, line_thick)
+    cv2.line(vis, (center[0], center[1] - cross_size), (center[0], center[1] + cross_size), color, line_thick)
+
+    return vis, using_yolo
+
+
+def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_paused, speed_multiplier, display_width, view_mode, hybrid_vis=None, using_yolo=False, update_features_with_yolo=False):
     orig_h, orig_w = yolo_vis.shape[:2]
 
     if view_mode == 0:
@@ -466,9 +514,22 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     elif view_mode == 1:
         video_combined = cv2.resize(yolo_vis, (video_width, video_height))
         cv2.putText(video_combined, "YOLO", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-    else:
+    elif view_mode == 2:
         video_combined = cv2.resize(feature_vis, (video_width, video_height))
         cv2.putText(video_combined, "FEATURES", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    else:
+        # Hybrid mode (view_mode == 3)
+        if hybrid_vis is not None:
+            video_combined = cv2.resize(hybrid_vis, (video_width, video_height))
+        else:
+            video_combined = cv2.resize(yolo_vis, (video_width, video_height))
+        # Label and color based on active method
+        if using_yolo:
+            cv2.putText(video_combined, "HYBRID", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(video_combined, "YOLO", (130, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        else:
+            cv2.putText(video_combined, "HYBRID", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 165, 255), 2)
+            cv2.putText(video_combined, "TRACKING", (130, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
     # Info bar
     stats = tracker.get_stats()
@@ -521,11 +582,25 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     cv2.putText(bar, f"{speed_multiplier:.1f}x", (700, 32), font, 0.6, (255, 255, 255), 1)
 
     # View
-    view_names = ["BOTH", "YOLO", "FEAT"]
-    cv2.putText(bar, f"V:{view_names[view_mode]}", (770, 32), font, 0.6, (255, 255, 0), 1)
+    view_names = ["BOTH", "YOLO", "FEAT", "HYBRID"]
+    view_color = (255, 255, 0)
+    if view_mode == 3:
+        view_color = (0, 255, 0) if using_yolo else (0, 165, 255)
+    cv2.putText(bar, f"V:{view_names[view_mode]}", (770, 32), font, 0.6, view_color, 1)
+
+    # Source indicator for hybrid mode
+    if view_mode == 3:
+        src_text = "SRC:YOLO" if using_yolo else "SRC:TRACK"
+        src_color = (0, 255, 0) if using_yolo else (0, 165, 255)
+        cv2.putText(bar, src_text, (860, 32), font, 0.5, src_color, 1)
+
+    # Update mode indicator
+    upd_text = "UPD:ON" if update_features_with_yolo else "UPD:OFF"
+    upd_color = (0, 255, 0) if update_features_with_yolo else (100, 100, 100)
+    cv2.putText(bar, upd_text, (950, 32), font, 0.5, upd_color, 1)
 
     # Progress bar
-    prog_x = 870
+    prog_x = 1030
     prog_w = display_width - prog_x - 10
     if prog_w > 50:
         progress = stats['frame'] / total_frames if total_frames > 0 else 0
@@ -536,7 +611,7 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     ctrl_height = 25
     ctrl_bar = np.zeros((ctrl_height, display_width, 3), dtype=np.uint8)
     ctrl_bar[:] = (30, 30, 30)
-    controls = "SPACE:Play/Pause  V:View  R:Reset  O:Open  +/-:Speed  Scroll:Size  Q:Quit"
+    controls = "SPACE:Play/Pause  V:View  U:Update  R:Reset  O:Open  +/-:Speed  Scroll:Size  Q:Quit"
     cv2.putText(ctrl_bar, controls, (10, 18), font, 0.45, (120, 120, 120), 1)
 
     result = np.vstack([bar, video_combined, ctrl_bar])
@@ -604,16 +679,24 @@ def main():
 
     last_yolo_vis = None
     last_feature_vis = None
+    last_hybrid_vis = None
+    last_using_yolo = False
     last_yolo_conf = 0
     last_scale = frame_width / 1920
+    last_feature_center = None
+    last_yolo_center = None
+    update_features_with_yolo = False
 
     # Read first frame
     ret, frame = cap.read()
     if ret:
-        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame)
+        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
         last_yolo_conf = yolo_conf
+        last_feature_center = feature_center
+        last_yolo_center = yolo_center
         last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
         last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
+        last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
 
     while True:
         if not paused:
@@ -623,15 +706,19 @@ def main():
                 tracker.reset()
                 continue
 
-            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame)
+            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
             last_yolo_conf = yolo_conf
+            last_feature_center = feature_center
+            last_yolo_center = yolo_center
             last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
             last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
+            last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
 
         if last_yolo_vis is not None and last_feature_vis is not None:
             display = create_display(
                 last_yolo_vis, last_feature_vis, tracker, last_yolo_conf,
-                total_frames, paused, speed_multiplier, display_width, view_mode
+                total_frames, paused, speed_multiplier, display_width, view_mode,
+                last_hybrid_vis, last_using_yolo, update_features_with_yolo
             )
             cv2.imshow(window_name, display)
 
@@ -642,17 +729,23 @@ def main():
         elif key == ord(' '):
             paused = not paused
         elif key == ord('v'):
-            view_mode = (view_mode + 1) % 3
+            view_mode = (view_mode + 1) % 4
+        elif key == ord('u'):
+            update_features_with_yolo = not update_features_with_yolo
+            print(f"Update features with YOLO: {'ON' if update_features_with_yolo else 'OFF'}")
         elif key == ord('r'):
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             tracker.reset()
             paused = True
             ret, frame = cap.read()
             if ret:
-                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame)
+                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
                 last_yolo_conf = yolo_conf
+                last_feature_center = feature_center
+                last_yolo_center = yolo_center
                 last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
                 last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
+                last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
         elif key == ord('o'):
             new_video = selector.select_video()
             if new_video:
@@ -670,10 +763,13 @@ def main():
                 paused = True
                 ret, frame = cap.read()
                 if ret:
-                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame)
+                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
                     last_yolo_conf = yolo_conf
+                    last_feature_center = feature_center
+                    last_yolo_center = yolo_center
                     last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
                     last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
+                    last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
         elif key == ord('+') or key == ord('='):
             delay = max(1, delay - 5)
             speed_multiplier = base_delay / delay
