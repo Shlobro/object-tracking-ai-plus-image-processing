@@ -7,7 +7,7 @@ echo.
 cd /d "%~dp0"
 
 echo Activating virtual environment...
-call venv\Scripts\activate.bat
+call "C:\Users\nadav\AppData\Local\Temp\skylyx_drone_venv\Scripts\activate.bat"
 
 echo Starting tracker...
 echo.
