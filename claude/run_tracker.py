@@ -66,6 +66,14 @@ class FeatureBasedTracker:
         self.base_gating_threshold = 100.0  # Threshold for blocking YOLO updates (pixels)
         self.search_radius = self.base_search_radius
         self.gating_threshold = self.base_gating_threshold
+        self.hybrid_update_interval_sec = 2.0
+        self.hybrid_feature_alpha = 0.25
+        self.hybrid_yolo_alpha = 0.25
+        self.base_hybrid_yolo_stable_max_delta = 25.0
+        self.hybrid_yolo_stable_max_delta = self.base_hybrid_yolo_stable_max_delta
+        self.hybrid_yolo_stable_frames = 3
+        self.fps = 30.0
+        self.hybrid_update_interval_frames = max(1, int(round(self.hybrid_update_interval_sec * self.fps)))
         self.apply_tracking_scale(self.tracking_scale)
         self.reset()
 
@@ -75,6 +83,7 @@ class FeatureBasedTracker:
         self.tracking_scale = float(scale)
         self.search_radius = max(1, int(round(self.base_search_radius * self.tracking_scale)))
         self.gating_threshold = max(1.0, float(self.base_gating_threshold * self.tracking_scale))
+        self.hybrid_yolo_stable_max_delta = max(1.0, float(self.base_hybrid_yolo_stable_max_delta * self.tracking_scale))
 
     def adjust_search_radius(self, delta):
         self.base_search_radius = max(50, self.base_search_radius + delta)
@@ -83,6 +92,31 @@ class FeatureBasedTracker:
     def adjust_gating_threshold(self, delta):
         self.base_gating_threshold = max(10, self.base_gating_threshold + delta)
         self.apply_tracking_scale(self.tracking_scale)
+
+    def set_fps(self, fps):
+        if fps and fps > 0:
+            self.fps = float(fps)
+        else:
+            self.fps = 30.0
+        self.hybrid_update_interval_frames = max(1, int(round(self.hybrid_update_interval_sec * self.fps)))
+
+    def smooth_center(self, current, target, alpha):
+        if target is None:
+            return current
+        target_arr = np.array(target, dtype=np.float32)
+        if current is None:
+            return target_arr
+        return current + (target_arr - current) * alpha
+
+    def update_vectors_from_yolo(self, yolo_center):
+        yolo_center_arr = np.array(yolo_center)
+        for p in self.tracked_points:
+            if p['active']:
+                direction = yolo_center_arr - p['point']
+                dist = np.linalg.norm(direction)
+                if dist > 10:
+                    p['direction'] = direction / dist
+                    p['distance'] = dist
 
     def reset(self):
         self.frame_count = 0
@@ -96,7 +130,11 @@ class FeatureBasedTracker:
         self.intersections_used = 0
         self.last_yolo_center = None
         self.last_yolo_bbox = None
+        self.last_yolo_frame = -999999
         self.frames_since_yolo = 0
+        self.memory_center = None
+        self.hybrid_last_update_frame = -999999
+        self.hybrid_yolo_stable_count = 0
         # Wait to initialize features until the full search radius is in-frame.
         self.initialized = False
         self.init_ready_frames = 0
@@ -341,12 +379,15 @@ class FeatureBasedTracker:
         is_gated = False
 
         # Always run YOLO to get ground truth for comparison
+        prev_yolo_center = self.last_yolo_center
+        prev_yolo_frame = self.last_yolo_frame
         yolo_center, yolo_bbox, yolo_conf = self.detect_with_yolo(frame)
 
         if yolo_center is not None:
             self.last_yolo_center = yolo_center
             self.last_yolo_bbox = yolo_bbox
             self.frames_since_yolo = 0
+            self.last_yolo_frame = self.frame_count
         else:
             self.frames_since_yolo += 1
 
@@ -383,6 +424,7 @@ class FeatureBasedTracker:
                     print(f"Frame {self.frame_count}: {len(self.tracked_points)} features")
                     if self.init_ready_frames >= self.init_frames:
                         self.initialized = True
+                        self.hybrid_last_update_frame = self.frame_count
 
             feature_center = yolo_center
         else:
@@ -396,23 +438,56 @@ class FeatureBasedTracker:
             if feature_center is not None and len(self.tracked_points) < self.num_features // 3:
                 self.add_new_features(gray, feature_center)
 
+            if feature_center is not None:
+                self.memory_center = self.smooth_center(self.memory_center, feature_center, self.hybrid_feature_alpha)
+
             # Update feature point directions/distances based on YOLO when available
             if update_features_with_yolo and yolo_center is not None:
+                ref_center = feature_center if feature_center is not None else self.memory_center
                 # Check for gating (large discrepancy)
-                if feature_center is not None:
-                    dist = np.linalg.norm(np.array(yolo_center) - feature_center)
+                if ref_center is not None:
+                    dist = np.linalg.norm(np.array(yolo_center) - ref_center)
                     if dist > self.gating_threshold:
                         is_gated = True
                 
                 if not is_gated:
-                    yolo_center_arr = np.array(yolo_center)
-                    for p in self.tracked_points:
-                        if p['active']:
-                            direction = yolo_center_arr - p['point']
-                            dist = np.linalg.norm(direction)
-                            if dist > 10:
-                                p['direction'] = direction / dist
-                                p['distance'] = dist
+                    self.update_vectors_from_yolo(yolo_center)
+
+            ref_center = feature_center if feature_center is not None else self.memory_center
+            hybrid_is_gated = False
+            if yolo_center is not None and ref_center is not None:
+                dist = np.linalg.norm(np.array(yolo_center) - ref_center)
+                if dist > self.gating_threshold:
+                    hybrid_is_gated = True
+
+            stable_this_frame = False
+            if yolo_center is not None and prev_yolo_center is not None:
+                if prev_yolo_frame == self.frame_count - 1:
+                    delta = np.linalg.norm(np.array(yolo_center) - np.array(prev_yolo_center))
+                    if delta <= self.hybrid_yolo_stable_max_delta:
+                        stable_this_frame = True
+
+            if yolo_center is None or hybrid_is_gated:
+                self.hybrid_yolo_stable_count = 0
+            elif stable_this_frame:
+                self.hybrid_yolo_stable_count += 1
+            else:
+                self.hybrid_yolo_stable_count = 0
+
+            should_hybrid_update = (
+                yolo_center is not None
+                and self.hybrid_update_interval_frames
+                and (self.frame_count - self.hybrid_last_update_frame) >= self.hybrid_update_interval_frames
+                and self.hybrid_yolo_stable_count >= self.hybrid_yolo_stable_frames
+            )
+            if should_hybrid_update:
+                if ref_center is not None and not hybrid_is_gated:
+                    self.memory_center = self.smooth_center(self.memory_center, yolo_center, self.hybrid_yolo_alpha)
+                    self.update_vectors_from_yolo(yolo_center)
+                    self.hybrid_last_update_frame = self.frame_count
+            is_gated = is_gated or hybrid_is_gated
+        if is_init_phase and feature_center is not None:
+            self.memory_center = np.array(feature_center, dtype=np.float32)
 
         self.prev_gray = gray.copy()
 
@@ -851,11 +926,10 @@ def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale, coord_scale=
     return vis
 
 
-def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False, coord_scale=1.0):
+def draw_hybrid_view(frame, memory_center, yolo_center, scale, is_gated=False, coord_scale=1.0):
     """
-    Draw hybrid view with single dot that switches between YOLO and feature-based.
-    - Green dot: YOLO active and trusted.
-    - Orange dot: Using internal feature memory (either YOLO lost or YOLO gated).
+    Draw hybrid view with a stable memory crosshair.
+    - Pink: Internal memory center (always primary).
     - Small Red dot: The 'bad' YOLO detection being ignored.
     """
     vis = frame.copy()
@@ -864,18 +938,11 @@ def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False, 
     pt_radius = max(6, int(10 * visual_scale))
     cross_size = max(14, int(24 * visual_scale))
 
-    # Determine what to show as the 'Primary' center
-    # If we are gated, we explicitly DO NOT trust YOLO, so we show the feature center
-    using_yolo = (yolo_center is not None) and (not is_gated)
-    
-    if using_yolo:
-        primary_center = tuple(map(int, np.array(yolo_center) * coord_scale))
-        primary_color = (0, 255, 0)  # Green
-    elif feature_center is not None:
-        primary_center = tuple(map(int, np.array(feature_center) * coord_scale))
-        primary_color = (0, 165, 255)  # Orange
-    else:
+    if memory_center is None:
         return vis, False
+
+    primary_center = tuple(map(int, np.array(memory_center) * coord_scale))
+    primary_color = (255, 0, 255)  # Pink
 
     # Draw Primary Crosshair
     cv2.circle(vis, primary_center, pt_radius, primary_color, -1)
@@ -894,7 +961,7 @@ def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False, 
         # Draw a dashed-style line between them to show the deviation
         cv2.line(vis, primary_center, yc, (0, 0, 255), 1, cv2.LINE_AA)
 
-    return vis, using_yolo
+    return vis, False
 
 
 def track_color(track_id):
@@ -1141,6 +1208,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    tracker.set_fps(fps)
     tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
     tracker.apply_tracking_scale(tracking_scale)
     tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
@@ -1181,6 +1249,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     last_feature_center = None
     last_yolo_center = None
     last_yolo_bbox = None
+    last_memory_center = None
     last_is_init = True
     update_features_with_yolo = False
     last_is_gated = False
@@ -1197,7 +1266,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         view_scale = (tracking_width if show_tracking_view else frame_width) / 1920
         last_yolo_vis = draw_yolo_view(base_frame, last_yolo_center, last_yolo_bbox, last_yolo_conf, view_scale, coord_scale)
         last_feature_vis = draw_feature_view(base_frame, tracker, last_feature_center, last_yolo_center, last_yolo_bbox, last_is_init, view_scale, coord_scale)
-        last_hybrid_vis, last_using_yolo = draw_hybrid_view(base_frame, last_feature_center, last_yolo_center, view_scale, last_is_gated, coord_scale)
+        last_hybrid_vis, last_using_yolo = draw_hybrid_view(base_frame, last_memory_center, last_yolo_center, view_scale, last_is_gated, coord_scale)
 
     ret, frame = cap.read()
     if ret:
@@ -1207,6 +1276,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         last_feature_center = feature_center
         last_yolo_center = yolo_center
         last_yolo_bbox = yolo_bbox
+        last_memory_center = tracker.memory_center
         last_is_init = is_init
         last_is_gated = is_gated
         last_frame = frame
@@ -1228,6 +1298,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
             last_feature_center = feature_center
             last_yolo_center = yolo_center
             last_yolo_bbox = yolo_bbox
+            last_memory_center = tracker.memory_center
             last_is_init = is_init
             last_is_gated = is_gated
             last_frame = frame
@@ -1270,6 +1341,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 last_feature_center = feature_center
                 last_yolo_center = yolo_center
                 last_yolo_bbox = yolo_bbox
+                last_memory_center = tracker.memory_center
                 last_is_init = is_init
                 last_is_gated = is_gated
                 last_frame = frame
@@ -1285,6 +1357,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                 frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                tracker.set_fps(fps)
                 tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
                 tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
                 base_delay = max(1, int(1000 / fps)) if fps > 0 else 33
@@ -1303,6 +1376,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                     last_feature_center = feature_center
                     last_yolo_center = yolo_center
                     last_yolo_bbox = yolo_bbox
+                    last_memory_center = tracker.memory_center
                     last_is_init = is_init
                     last_is_gated = is_gated
                     last_frame = frame
