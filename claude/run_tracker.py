@@ -297,21 +297,39 @@ class FeatureBasedTracker:
                 self.last_center = np.array(yolo_center)
                 self.last_bbox = yolo_bbox
 
-                # Track existing points
-                if self.prev_gray is not None and self.tracked_points:
-                    self.track_points_optical_flow(self.prev_gray, gray)
+                # Check if full search radius is in frame
+                h, w = gray.shape
+                cx, cy = yolo_center
+                r = self.search_radius
+                
+                is_fully_in_frame = (
+                    (cx - r >= 0) and (cx + r < w) and
+                    (cy - r >= 0) and (cy + r < h)
+                )
 
-                # Find new features
-                new_features = self.find_features_around_point(gray, yolo_center, yolo_bbox)
-
-                # Replace or add features
-                if self.frame_count == 1 or len(self.tracked_points) < self.num_features // 3:
-                    self.tracked_points = new_features
+                if not is_fully_in_frame:
+                    print(f"Frame {self.frame_count}: Object too close to edge, waiting to init features...")
+                    # Even if we tracked points from previous frame, we might want to clear them 
+                    # or just maintain them but not add new ones. 
+                    # For safety, let's just track existing ones if any, but not add new ones.
+                    if self.prev_gray is not None and self.tracked_points:
+                        self.track_points_optical_flow(self.prev_gray, gray)
                 else:
-                    # Add new features to fill gaps
-                    self.add_new_features(gray, yolo_center)
+                    # Track existing points
+                    if self.prev_gray is not None and self.tracked_points:
+                        self.track_points_optical_flow(self.prev_gray, gray)
 
-                print(f"Frame {self.frame_count}: {len(self.tracked_points)} features")
+                    # Find new features
+                    new_features = self.find_features_around_point(gray, yolo_center, yolo_bbox)
+
+                    # Replace or add features
+                    if self.frame_count == 1 or len(self.tracked_points) < self.num_features // 3:
+                        self.tracked_points = new_features
+                    else:
+                        # Add new features to fill gaps
+                        self.add_new_features(gray, yolo_center)
+
+                    print(f"Frame {self.frame_count}: {len(self.tracked_points)} features")
 
             feature_center = yolo_center
         else:
