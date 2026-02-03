@@ -52,6 +52,20 @@ class FeatureBasedTracker:
         self.last_yolo_center = None
         self.last_yolo_bbox = None
         self.frames_since_yolo = 0
+        # Wait to initialize features until the full search radius is in-frame.
+        self.initialized = False
+        self.init_ready_frames = 0
+
+    def is_search_radius_in_frame(self, center, shape):
+        if center is None:
+            return False
+        h, w = shape
+        cx, cy = center
+        r = self.search_radius
+        return (
+            (cx - r >= 0) and (cx + r < w) and
+            (cy - r >= 0) and (cy + r < h)
+        )
 
     def detect_with_yolo(self, frame):
         results = self.model(frame, verbose=False, conf=0.3)
@@ -278,7 +292,7 @@ class FeatureBasedTracker:
         self.frame_count += 1
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        is_init_phase = self.frame_count <= self.init_frames
+        is_init_phase = not self.initialized
         is_gated = False
 
         # Always run YOLO to get ground truth for comparison
@@ -298,23 +312,15 @@ class FeatureBasedTracker:
                 self.last_bbox = yolo_bbox
 
                 # Check if full search radius is in frame
-                h, w = gray.shape
-                cx, cy = yolo_center
-                r = self.search_radius
-                
-                is_fully_in_frame = (
-                    (cx - r >= 0) and (cx + r < w) and
-                    (cy - r >= 0) and (cy + r < h)
-                )
+                is_fully_in_frame = self.is_search_radius_in_frame(yolo_center, gray.shape)
 
                 if not is_fully_in_frame:
                     print(f"Frame {self.frame_count}: Object too close to edge, waiting to init features...")
-                    # Even if we tracked points from previous frame, we might want to clear them 
-                    # or just maintain them but not add new ones. 
-                    # For safety, let's just track existing ones if any, but not add new ones.
-                    if self.prev_gray is not None and self.tracked_points:
-                        self.track_points_optical_flow(self.prev_gray, gray)
+                    self.init_ready_frames = 0
+                    # Avoid one-sided initialization when the search radius is clipped.
+                    self.tracked_points = []
                 else:
+                    self.init_ready_frames += 1
                     # Track existing points
                     if self.prev_gray is not None and self.tracked_points:
                         self.track_points_optical_flow(self.prev_gray, gray)
@@ -330,6 +336,8 @@ class FeatureBasedTracker:
                         self.add_new_features(gray, yolo_center)
 
                     print(f"Frame {self.frame_count}: {len(self.tracked_points)} features")
+                    if self.init_ready_frames >= self.init_frames:
+                        self.initialized = True
 
             feature_center = yolo_center
         else:
@@ -382,7 +390,7 @@ class FeatureBasedTracker:
             'intersections': self.intersections_used,
             'avg_error': avg_error,
             'current_error': current_error,
-            'is_init': self.frame_count <= self.init_frames
+            'is_init': not self.initialized
         }
 
 
