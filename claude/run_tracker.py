@@ -36,6 +36,7 @@ class FeatureBasedTracker:
             maxLevel=4,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
         )
+        self.gating_threshold = 100.0  # Threshold for blocking YOLO updates (pixels)
         self.reset()
 
     def reset(self):
@@ -278,6 +279,7 @@ class FeatureBasedTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         is_init_phase = self.frame_count <= self.init_frames
+        is_gated = False
 
         # Always run YOLO to get ground truth for comparison
         yolo_center, yolo_bbox, yolo_conf = self.detect_with_yolo(frame)
@@ -325,14 +327,21 @@ class FeatureBasedTracker:
 
             # Update feature point directions/distances based on YOLO when available
             if update_features_with_yolo and yolo_center is not None:
-                yolo_center_arr = np.array(yolo_center)
-                for p in self.tracked_points:
-                    if p['active']:
-                        direction = yolo_center_arr - p['point']
-                        dist = np.linalg.norm(direction)
-                        if dist > 10:
-                            p['direction'] = direction / dist
-                            p['distance'] = dist
+                # Check for gating (large discrepancy)
+                if feature_center is not None:
+                    dist = np.linalg.norm(np.array(yolo_center) - feature_center)
+                    if dist > self.gating_threshold:
+                        is_gated = True
+                
+                if not is_gated:
+                    yolo_center_arr = np.array(yolo_center)
+                    for p in self.tracked_points:
+                        if p['active']:
+                            direction = yolo_center_arr - p['point']
+                            dist = np.linalg.norm(direction)
+                            if dist > 10:
+                                p['direction'] = direction / dist
+                                p['distance'] = dist
 
         self.prev_gray = gray.copy()
 
@@ -342,7 +351,7 @@ class FeatureBasedTracker:
                            (feature_center[1] - yolo_center[1])**2)
             self.error_history.append(error)
 
-        return feature_center, yolo_center, yolo_bbox, yolo_conf, is_init_phase
+        return feature_center, yolo_center, yolo_bbox, yolo_conf, is_init_phase, is_gated
 
     def get_stats(self):
         active = sum(1 for p in self.tracked_points if p['active'] and p['lost_count'] == 0)
@@ -766,39 +775,47 @@ def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale):
     return vis
 
 
-def draw_hybrid_view(frame, feature_center, yolo_center, scale):
+def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False):
     """
     Draw hybrid view with single dot that switches between YOLO and feature-based.
-    - Green dot + "YOLO" label when YOLO detection available
-    - Orange dot + "TRACKING" label when using feature-based fallback
-    Returns: (visualization, using_yolo boolean)
+    - Green dot: YOLO active and trusted.
+    - Orange dot: Using internal feature memory (either YOLO lost or YOLO gated).
+    - Small Red dot: The 'bad' YOLO detection being ignored.
     """
     vis = frame.copy()
     line_thick = max(2, int(3 * scale))
     pt_radius = max(8, int(12 * scale))
     cross_size = max(20, int(30 * scale))
 
-    using_yolo = yolo_center is not None
-
+    # Determine what to show as the 'Primary' center
+    # If we are gated, we explicitly DO NOT trust YOLO, so we show the feature center
+    using_yolo = (yolo_center is not None) and (not is_gated)
+    
     if using_yolo:
-        # Use YOLO position - green
-        center = tuple(map(int, yolo_center))
-        color = (0, 255, 0)  # Green
+        primary_center = tuple(map(int, yolo_center))
+        primary_color = (0, 255, 0)  # Green
     elif feature_center is not None:
-        # Use feature-based position - orange
-        center = tuple(map(int, feature_center))
-        color = (0, 165, 255)  # Orange
+        primary_center = tuple(map(int, feature_center))
+        primary_color = (0, 165, 255)  # Orange
     else:
-        # No position available
         return vis, False
 
-    # Draw filled circle with white outline
-    cv2.circle(vis, center, pt_radius, color, -1)
-    cv2.circle(vis, center, pt_radius + 2, (255, 255, 255), line_thick)
+    # Draw Primary Crosshair
+    cv2.circle(vis, primary_center, pt_radius, primary_color, -1)
+    cv2.circle(vis, primary_center, pt_radius + 2, (255, 255, 255), line_thick)
+    cv2.line(vis, (primary_center[0] - cross_size, primary_center[1]), (primary_center[0] + cross_size, primary_center[1]), primary_color, line_thick)
+    cv2.line(vis, (primary_center[0], primary_center[1] - cross_size), (primary_center[0], primary_center[1] + cross_size), primary_color, line_thick)
 
-    # Draw crosshairs
-    cv2.line(vis, (center[0] - cross_size, center[1]), (center[0] + cross_size, center[1]), color, line_thick)
-    cv2.line(vis, (center[0], center[1] - cross_size), (center[0], center[1] + cross_size), color, line_thick)
+    # If Gated, show the 'Bad' YOLO detection as a reference
+    if is_gated and yolo_center is not None:
+        yc = tuple(map(int, yolo_center))
+        # Draw small red dot for the bad detection
+        cv2.circle(vis, yc, int(pt_radius * 0.5), (0, 0, 255), -1)
+        cv2.circle(vis, yc, int(pt_radius * 0.5) + 2, (255, 255, 255), 1)
+        # Draw "GATED" text near the bad detection
+        cv2.putText(vis, "BLOCKED", (yc[0] + 15, yc[1] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        # Draw a dashed-style line between them to show the deviation
+        cv2.line(vis, primary_center, yc, (0, 0, 255), 1, cv2.LINE_AA)
 
     return vis, using_yolo
 
@@ -893,7 +910,7 @@ def create_track_display(track_vis, frame_index, total_frames, is_paused, speed_
     return result
 
 
-def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_paused, speed_multiplier, display_width, view_mode, hybrid_vis=None, using_yolo=False, update_features_with_yolo=False):
+def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_paused, speed_multiplier, display_width, view_mode, hybrid_vis=None, using_yolo=False, update_features_with_yolo=False, is_gated=False):
     orig_h, orig_w = yolo_vis.shape[:2]
 
     if view_mode == 0:
@@ -987,19 +1004,21 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
         view_color = (0, 255, 0) if using_yolo else (0, 165, 255)
     cv2.putText(bar, f"V:{view_names[view_mode]}", (770, 32), font, 0.6, view_color, 1)
 
-    # Source indicator for hybrid mode
-    if view_mode == 3:
-        src_text = "SRC:YOLO" if using_yolo else "SRC:TRACK"
-        src_color = (0, 255, 0) if using_yolo else (0, 165, 255)
-        cv2.putText(bar, src_text, (860, 32), font, 0.5, src_color, 1)
-
-    # Update mode indicator
+    # Update mode indicator & Gating Status
     upd_text = "UPD:ON" if update_features_with_yolo else "UPD:OFF"
     upd_color = (0, 255, 0) if update_features_with_yolo else (100, 100, 100)
-    cv2.putText(bar, upd_text, (950, 32), font, 0.5, upd_color, 1)
+    cv2.putText(bar, upd_text, (880, 32), font, 0.5, upd_color, 1)
+    
+    # Gating Threshold
+    gate_color = (0, 255, 255)
+    if is_gated:
+        gate_color = (0, 0, 255) # RED if gated
+        cv2.putText(bar, "GATED!", (1080, 32), font, 0.6, (0, 0, 255), 2)
+    
+    cv2.putText(bar, f"Gate:{tracker.gating_threshold:.0f}px", (960, 32), font, 0.5, gate_color, 1)
 
     # Progress bar
-    prog_x = 1030
+    prog_x = 1180
     prog_w = display_width - prog_x - 10
     if prog_w > 50:
         progress = stats['frame'] / total_frames if total_frames > 0 else 0
@@ -1010,7 +1029,7 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     ctrl_height = 25
     ctrl_bar = np.zeros((ctrl_height, display_width, 3), dtype=np.uint8)
     ctrl_bar[:] = (30, 30, 30)
-    controls = "SPACE:Play/Pause  V:View  U:Update  R:Reset  O:Open  S:Settings  +/-:Speed  Scroll:Size  Q:Quit"
+    controls = "SPACE:Play/Pause  V:View  U:Update  [ / ]:Gate Thresh  R:Reset  O:Open  S:Settings  +/-:Speed  Q:Quit"
     cv2.putText(ctrl_bar, controls, (10, 18), font, 0.45, (120, 120, 120), 1)
 
     result = np.vstack([bar, video_combined, ctrl_bar])
@@ -1032,7 +1051,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     print(f"FPS: {fps:.1f}, Frames: {total_frames}")
-    print("\nSPACE:Play/Pause V:View U:Update R:Reset O:Open S:Settings Q:Quit")
+    print("\nSPACE:Play/Pause V:View U:Update [ / ]:Gate Thresh R:Reset O:Open S:Settings Q:Quit")
 
     display_width = 1200
     min_width = 600
@@ -1066,16 +1085,18 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     last_feature_center = None
     last_yolo_center = None
     update_features_with_yolo = False
+    last_is_gated = False
 
     ret, frame = cap.read()
     if ret:
-        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
+        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
         last_yolo_conf = yolo_conf
         last_feature_center = feature_center
         last_yolo_center = yolo_center
+        last_is_gated = is_gated
         last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
         last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-        last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
+        last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
 
     next_selection = None
     while True:
@@ -1086,19 +1107,20 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 tracker.reset()
                 continue
 
-            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
+            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
             last_yolo_conf = yolo_conf
             last_feature_center = feature_center
             last_yolo_center = yolo_center
+            last_is_gated = is_gated
             last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
             last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-            last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
+            last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
 
         if last_yolo_vis is not None and last_feature_vis is not None:
             display = create_display(
                 last_yolo_vis, last_feature_vis, tracker, last_yolo_conf,
                 total_frames, paused, speed_multiplier, display_width, view_mode,
-                last_hybrid_vis, last_using_yolo, update_features_with_yolo
+                last_hybrid_vis, last_using_yolo, update_features_with_yolo, last_is_gated
             )
             cv2.imshow(window_name, display)
 
@@ -1119,13 +1141,14 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
             paused = True
             ret, frame = cap.read()
             if ret:
-                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
+                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
                 last_yolo_conf = yolo_conf
                 last_feature_center = feature_center
                 last_yolo_center = yolo_center
+                last_is_gated = is_gated
                 last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
                 last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-                last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
+                last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
         elif key == ord('o'):
             new_video = selector.select_video()
             if new_video:
@@ -1143,13 +1166,14 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 paused = True
                 ret, frame = cap.read()
                 if ret:
-                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init = tracker.process_frame(frame, update_features_with_yolo)
+                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
                     last_yolo_conf = yolo_conf
                     last_feature_center = feature_center
                     last_yolo_center = yolo_center
+                    last_is_gated = is_gated
                     last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
                     last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-                    last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale)
+                    last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
         elif key == ord('s'):
             selection = config_dialog.select(
                 default_video_path=video_path,
@@ -1159,6 +1183,12 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
             if selection:
                 next_selection = selection
                 break
+        elif key == ord(']'):
+            tracker.gating_threshold += 10
+            print(f"Gating Threshold increased to: {tracker.gating_threshold}")
+        elif key == ord('['):
+            tracker.gating_threshold = max(10, tracker.gating_threshold - 10)
+            print(f"Gating Threshold decreased to: {tracker.gating_threshold}")
         elif key == ord('+') or key == ord('='):
             delay = max(1, delay - 5)
             speed_multiplier = base_delay / delay
