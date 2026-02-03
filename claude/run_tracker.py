@@ -11,6 +11,31 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+TARGET_STREAM_WIDTH = 640
+
+
+def compute_tracking_resize(frame_width, frame_height, target_width=TARGET_STREAM_WIDTH):
+    if frame_width <= target_width:
+        return 1.0, frame_width, frame_height
+    scale = target_width / float(frame_width)
+    target_height = max(1, int(round(frame_height * scale)))
+    return scale, target_width, target_height
+
+
+def resize_for_tracking(frame, tracking_width, tracking_height, scale):
+    if scale >= 1.0:
+        return frame
+    return cv2.resize(frame, (tracking_width, tracking_height), interpolation=cv2.INTER_AREA)
+
+def log_tracking_resize(label, frame_width, frame_height, tracking_width, tracking_height, scale):
+    if scale >= 1.0:
+        print(f"{label}: no downscale ({frame_width}x{frame_height})")
+        return
+    print(
+        f"{label}: downscale {frame_width}x{frame_height} -> "
+        f"{tracking_width}x{tracking_height} (scale {scale:.3f})"
+    )
+
 
 class FeatureBasedTracker:
     def __init__(self, model_path, init_frames=5, num_features=30, search_radius=350):
@@ -18,7 +43,8 @@ class FeatureBasedTracker:
         self.model = YOLO(model_path)
         self.init_frames = init_frames
         self.num_features = num_features
-        self.search_radius = search_radius
+        self.base_search_radius = search_radius
+        self.tracking_scale = 1.0
 
         # Use ORB - faster and often finds more features than SIFT in textured areas
         self.orb = cv2.ORB_create(nfeatures=1000, scoreType=cv2.ORB_HARRIS_SCORE)
@@ -36,8 +62,26 @@ class FeatureBasedTracker:
             maxLevel=4,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
         )
-        self.gating_threshold = 100.0  # Threshold for blocking YOLO updates (pixels)
+        self.base_gating_threshold = 100.0  # Threshold for blocking YOLO updates (pixels)
+        self.search_radius = self.base_search_radius
+        self.gating_threshold = self.base_gating_threshold
+        self.apply_tracking_scale(self.tracking_scale)
         self.reset()
+
+    def apply_tracking_scale(self, scale):
+        if not scale or scale <= 0:
+            scale = 1.0
+        self.tracking_scale = float(scale)
+        self.search_radius = max(1, int(round(self.base_search_radius * self.tracking_scale)))
+        self.gating_threshold = max(1.0, float(self.base_gating_threshold * self.tracking_scale))
+
+    def adjust_search_radius(self, delta):
+        self.base_search_radius = max(50, self.base_search_radius + delta)
+        self.apply_tracking_scale(self.tracking_scale)
+
+    def adjust_gating_threshold(self, delta):
+        self.base_gating_threshold = max(10, self.base_gating_threshold + delta)
+        self.apply_tracking_scale(self.tracking_scale)
 
     def reset(self):
         self.frame_count = 0
@@ -375,6 +419,8 @@ class FeatureBasedTracker:
         if feature_center is not None and yolo_center is not None:
             error = np.sqrt((feature_center[0] - yolo_center[0])**2 +
                            (feature_center[1] - yolo_center[1])**2)
+            if self.tracking_scale > 0:
+                error = error / self.tracking_scale
             self.error_history.append(error)
 
         return feature_center, yolo_center, yolo_bbox, yolo_conf, is_init_phase, is_gated
@@ -722,7 +768,7 @@ class TrackerParamsDialog:
         return self.result
 
 
-def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init_phase, scale):
+def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init_phase, scale, coord_scale=1.0):
     vis = frame.copy()
     pt_radius = max(6, int(10 * scale))
     line_thick = max(2, int(3 * scale))
@@ -730,15 +776,16 @@ def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is
 
     # Draw search radius
     if feature_center is not None:
-        fc = tuple(map(int, feature_center))
-        cv2.circle(vis, fc, tracker.search_radius, (60, 60, 60), 1, cv2.LINE_AA)
+        fc = tuple(map(int, np.array(feature_center) * coord_scale))
+        radius = max(1, int(round(tracker.search_radius * coord_scale)))
+        cv2.circle(vis, fc, radius, (60, 60, 60), 1, cv2.LINE_AA)
 
     # Draw each tracked feature
     for i, p in enumerate(tracker.tracked_points):
         if not p['active']:
             continue
 
-        pt = tuple(map(int, p['point']))
+        pt = tuple(map(int, p['point'] * coord_scale))
 
         # Color by age - older = more trusted
         if p['age'] > 20:
@@ -755,7 +802,7 @@ def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is
         # Draw direction line
         line_len = min(p['distance'], 200)
         end_pt = p['point'] + p['direction'] * line_len
-        end_pt_tuple = tuple(map(int, end_pt))
+        end_pt_tuple = tuple(map(int, end_pt * coord_scale))
         cv2.arrowedLine(vis, pt, end_pt_tuple, (0, 255, 255), line_thick, cv2.LINE_AA, tipLength=0.06)
 
         # Draw point number
@@ -763,7 +810,7 @@ def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is
 
     # Draw estimated center
     if feature_center is not None:
-        fc = tuple(map(int, feature_center))
+        fc = tuple(map(int, np.array(feature_center) * coord_scale))
         cv2.line(vis, (fc[0] - cross_size, fc[1]), (fc[0] + cross_size, fc[1]), (255, 0, 255), line_thick + 1)
         cv2.line(vis, (fc[0], fc[1] - cross_size), (fc[0], fc[1] + cross_size), (255, 0, 255), line_thick + 1)
         cv2.circle(vis, fc, int(cross_size * 0.5), (255, 0, 255), line_thick + 1)
@@ -771,28 +818,28 @@ def draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is
 
     # Draw YOLO center for comparison (when tracking)
     if yolo_center is not None and not is_init_phase:
-        yc = tuple(map(int, yolo_center))
+        yc = tuple(map(int, np.array(yolo_center) * coord_scale))
         cv2.circle(vis, yc, pt_radius, (0, 0, 255), line_thick)
         # Draw error line
         if feature_center is not None:
-            fc = tuple(map(int, feature_center))
+            fc = tuple(map(int, np.array(feature_center) * coord_scale))
             cv2.line(vis, fc, yc, (0, 0, 255), 1, cv2.LINE_AA)
 
     return vis
 
 
-def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale):
+def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale, coord_scale=1.0):
     vis = frame.copy()
     line_thick = max(2, int(3 * scale))
     pt_radius = max(8, int(12 * scale))
     cross_size = max(20, int(30 * scale))
 
     if yolo_bbox is not None:
-        x1, y1, x2, y2 = map(int, yolo_bbox)
+        x1, y1, x2, y2 = [int(round(v * coord_scale)) for v in yolo_bbox]
         cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), line_thick + 1)
 
     if yolo_center is not None:
-        yc = tuple(map(int, yolo_center))
+        yc = tuple(map(int, np.array(yolo_center) * coord_scale))
         cv2.circle(vis, yc, pt_radius, (0, 0, 255), -1)
         cv2.circle(vis, yc, pt_radius + 2, (255, 255, 255), line_thick)
         cv2.line(vis, (yc[0] - cross_size, yc[1]), (yc[0] + cross_size, yc[1]), (0, 0, 255), line_thick)
@@ -801,7 +848,7 @@ def draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, scale):
     return vis
 
 
-def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False):
+def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False, coord_scale=1.0):
     """
     Draw hybrid view with single dot that switches between YOLO and feature-based.
     - Green dot: YOLO active and trusted.
@@ -818,10 +865,10 @@ def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False):
     using_yolo = (yolo_center is not None) and (not is_gated)
     
     if using_yolo:
-        primary_center = tuple(map(int, yolo_center))
+        primary_center = tuple(map(int, np.array(yolo_center) * coord_scale))
         primary_color = (0, 255, 0)  # Green
     elif feature_center is not None:
-        primary_center = tuple(map(int, feature_center))
+        primary_center = tuple(map(int, np.array(feature_center) * coord_scale))
         primary_color = (0, 165, 255)  # Orange
     else:
         return vis, False
@@ -834,7 +881,7 @@ def draw_hybrid_view(frame, feature_center, yolo_center, scale, is_gated=False):
 
     # If Gated, show the 'Bad' YOLO detection as a reference
     if is_gated and yolo_center is not None:
-        yc = tuple(map(int, yolo_center))
+        yc = tuple(map(int, np.array(yolo_center) * coord_scale))
         # Draw small red dot for the bad detection
         cv2.circle(vis, yc, int(pt_radius * 0.5), (0, 0, 255), -1)
         cv2.circle(vis, yc, int(pt_radius * 0.5) + 2, (255, 255, 255), 1)
@@ -864,7 +911,7 @@ def track_color(track_id):
     return palette[track_id % len(palette)]
 
 
-def extract_tracks(result):
+def extract_tracks(result, coord_scale=1.0):
     if result is None or result.boxes is None or len(result.boxes) == 0:
         return []
     boxes = result.boxes
@@ -875,7 +922,10 @@ def extract_tracks(result):
     for i in range(len(xyxy)):
         track_id = int(ids[i]) if ids is not None else None
         conf = float(confs[i]) if confs is not None else 0.0
-        tracks.append((xyxy[i], track_id, conf))
+        box = xyxy[i]
+        if coord_scale != 1.0:
+            box = box * coord_scale
+        tracks.append((box, track_id, conf))
     return tracks
 
 
@@ -1043,7 +1093,7 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     
     cv2.putText(
         bar,
-        f"Gate:{tracker.gating_threshold:.0f}px Rad:{tracker.search_radius:.0f}px",
+        f"Gate:{tracker.base_gating_threshold:.0f}px Rad:{tracker.base_search_radius:.0f}px",
         (900, 32),
         font,
         0.5,
@@ -1083,6 +1133,11 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
+    tracker.apply_tracking_scale(tracking_scale)
+    tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
+    log_tracking_resize("Tracking input", frame_width, frame_height, tracking_width, tracking_height, tracking_scale)
 
     print(f"FPS: {fps:.1f}, Frames: {total_frames}")
     print("\nSPACE:Play/Pause V:View U:Update [ / ]:Gate Thresh , / .:Radius R:Reset O:Open S:Settings Q:Quit")
@@ -1123,14 +1178,15 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
 
     ret, frame = cap.read()
     if ret:
-        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
+        tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+        feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(tracking_frame, update_features_with_yolo)
         last_yolo_conf = yolo_conf
         last_feature_center = feature_center
         last_yolo_center = yolo_center
         last_is_gated = is_gated
-        last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
-        last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-        last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
+        last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale, tracking_to_display_scale)
+        last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale, tracking_to_display_scale)
+        last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated, tracking_to_display_scale)
 
     next_selection = None
     while True:
@@ -1141,14 +1197,15 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 tracker.reset()
                 continue
 
-            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
+            tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+            feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(tracking_frame, update_features_with_yolo)
             last_yolo_conf = yolo_conf
             last_feature_center = feature_center
             last_yolo_center = yolo_center
             last_is_gated = is_gated
-            last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
-            last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-            last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
+            last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale, tracking_to_display_scale)
+            last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale, tracking_to_display_scale)
+            last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated, tracking_to_display_scale)
 
         if last_yolo_vis is not None and last_feature_vis is not None:
             display = create_display(
@@ -1172,17 +1229,19 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         elif key == ord('r'):
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             tracker.reset()
+            tracker.apply_tracking_scale(tracking_scale)
             paused = True
             ret, frame = cap.read()
             if ret:
-                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
+                tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+                feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(tracking_frame, update_features_with_yolo)
                 last_yolo_conf = yolo_conf
                 last_feature_center = feature_center
                 last_yolo_center = yolo_center
                 last_is_gated = is_gated
-                last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
-                last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-                last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
+                last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale, tracking_to_display_scale)
+                last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale, tracking_to_display_scale)
+                last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated, tracking_to_display_scale)
         elif key == ord('o'):
             new_video = selector.select_video()
             if new_video:
@@ -1192,22 +1251,28 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
+                tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
                 base_delay = max(1, int(1000 / fps)) if fps > 0 else 33
                 delay = base_delay
                 speed_multiplier = 1.0
                 last_scale = frame_width / 1920
                 tracker.reset()
+                tracker.apply_tracking_scale(tracking_scale)
+                log_tracking_resize("Tracking input", frame_width, frame_height, tracking_width, tracking_height, tracking_scale)
                 paused = True
                 ret, frame = cap.read()
                 if ret:
-                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(frame, update_features_with_yolo)
+                    tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+                    feature_center, yolo_center, yolo_bbox, yolo_conf, is_init, is_gated = tracker.process_frame(tracking_frame, update_features_with_yolo)
                     last_yolo_conf = yolo_conf
                     last_feature_center = feature_center
                     last_yolo_center = yolo_center
                     last_is_gated = is_gated
-                    last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale)
-                    last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale)
-                    last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated)
+                    last_yolo_vis = draw_yolo_view(frame, yolo_center, yolo_bbox, yolo_conf, last_scale, tracking_to_display_scale)
+                    last_feature_vis = draw_feature_view(frame, tracker, feature_center, yolo_center, yolo_bbox, is_init, last_scale, tracking_to_display_scale)
+                    last_hybrid_vis, last_using_yolo = draw_hybrid_view(frame, feature_center, yolo_center, last_scale, is_gated, tracking_to_display_scale)
         elif key == ord('s'):
             selection = config_dialog.select(
                 default_video_path=video_path,
@@ -1218,17 +1283,29 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 next_selection = selection
                 break
         elif key == ord(']'):
-            tracker.gating_threshold += 10
-            print(f"Gating Threshold increased to: {tracker.gating_threshold}")
+            tracker.adjust_gating_threshold(10)
+            print(
+                f"Gating Threshold: {tracker.base_gating_threshold} "
+                f"(scaled {tracker.gating_threshold:.0f})"
+            )
         elif key == ord('['):
-            tracker.gating_threshold = max(10, tracker.gating_threshold - 10)
-            print(f"Gating Threshold decreased to: {tracker.gating_threshold}")
+            tracker.adjust_gating_threshold(-10)
+            print(
+                f"Gating Threshold: {tracker.base_gating_threshold} "
+                f"(scaled {tracker.gating_threshold:.0f})"
+            )
         elif key == ord('.'):
-            tracker.search_radius += 10
-            print(f"Search radius increased to: {tracker.search_radius}")
+            tracker.adjust_search_radius(10)
+            print(
+                f"Search radius: {tracker.base_search_radius} "
+                f"(scaled {tracker.search_radius:.0f})"
+            )
         elif key == ord(','):
-            tracker.search_radius = max(50, tracker.search_radius - 10)
-            print(f"Search radius decreased to: {tracker.search_radius}")
+            tracker.adjust_search_radius(-10)
+            print(
+                f"Search radius: {tracker.base_search_radius} "
+                f"(scaled {tracker.search_radius:.0f})"
+            )
         elif key == ord('+') or key == ord('='):
             delay = max(1, delay - 5)
             speed_multiplier = base_delay / delay
@@ -1254,8 +1331,12 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
+    tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
 
     print(f"FPS: {fps:.1f}, Frames: {total_frames}")
+    log_tracking_resize("Tracking input", frame_width, frame_height, tracking_width, tracking_height, tracking_scale)
     print("\nSPACE:Play/Pause R:Reset O:Open S:Settings P:Params +/-:Speed Q:Quit")
 
     display_width = 1200
@@ -1286,8 +1367,9 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
 
     ret, frame = cap.read()
     if ret:
-        result = tracker.process_frame(frame)
-        tracks = extract_tracks(result)
+        tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+        result = tracker.process_frame(tracking_frame)
+        tracks = extract_tracks(result, tracking_to_display_scale)
         last_track_count = len(tracks)
         last_track_vis = draw_track_view(frame, tracks, last_scale, tracker_label)
 
@@ -1300,8 +1382,9 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
                 tracker.reset()
                 continue
 
-            result = tracker.process_frame(frame)
-            tracks = extract_tracks(result)
+            tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+            result = tracker.process_frame(tracking_frame)
+            tracks = extract_tracks(result, tracking_to_display_scale)
             last_track_count = len(tracks)
             last_track_vis = draw_track_view(frame, tracks, last_scale, tracker_label)
 
@@ -1324,8 +1407,9 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
             paused = True
             ret, frame = cap.read()
             if ret:
-                result = tracker.process_frame(frame)
-                tracks = extract_tracks(result)
+                tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+                result = tracker.process_frame(tracking_frame)
+                tracks = extract_tracks(result, tracking_to_display_scale)
                 last_track_count = len(tracks)
                 last_track_vis = draw_track_view(frame, tracks, last_scale, tracker_label)
         elif key == ord('o'):
@@ -1337,16 +1421,21 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
                 fps = cap.get(cv2.CAP_PROP_FPS)
                 total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
                 frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                tracking_scale, tracking_width, tracking_height = compute_tracking_resize(frame_width, frame_height)
+                tracking_to_display_scale = 1.0 / tracking_scale if tracking_scale > 0 else 1.0
                 base_delay = max(1, int(1000 / fps)) if fps > 0 else 33
                 delay = base_delay
                 speed_multiplier = 1.0
                 last_scale = frame_width / 1920
                 tracker.reset()
                 paused = True
+                log_tracking_resize("Tracking input", frame_width, frame_height, tracking_width, tracking_height, tracking_scale)
                 ret, frame = cap.read()
                 if ret:
-                    result = tracker.process_frame(frame)
-                    tracks = extract_tracks(result)
+                    tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+                    result = tracker.process_frame(tracking_frame)
+                    tracks = extract_tracks(result, tracking_to_display_scale)
                     last_track_count = len(tracks)
                     last_track_vis = draw_track_view(frame, tracks, last_scale, tracker_label)
         elif key == ord('s'):
@@ -1370,8 +1459,9 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
                     paused = True
                     ret, frame = cap.read()
                     if ret:
-                        result = tracker.process_frame(frame)
-                        tracks = extract_tracks(result)
+                        tracking_frame = resize_for_tracking(frame, tracking_width, tracking_height, tracking_scale)
+                        result = tracker.process_frame(tracking_frame)
+                        tracks = extract_tracks(result, tracking_to_display_scale)
                         last_track_count = len(tracks)
                         last_track_vis = draw_track_view(frame, tracks, last_scale, tracker_label)
                 else:
