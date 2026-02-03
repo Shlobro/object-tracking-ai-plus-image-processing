@@ -1035,13 +1035,21 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     upd_color = (0, 255, 0) if update_features_with_yolo else (100, 100, 100)
     cv2.putText(bar, upd_text, (880, 32), font, 0.5, upd_color, 1)
     
-    # Gating Threshold
+    # Gating Threshold + Search Radius
     gate_color = (0, 255, 255)
     if is_gated:
         gate_color = (0, 0, 255) # RED if gated
-        cv2.putText(bar, "GATED!", (1080, 32), font, 0.6, (0, 0, 255), 2)
+        cv2.putText(bar, "GATED!", (1060, 32), font, 0.6, (0, 0, 255), 2)
     
-    cv2.putText(bar, f"Gate:{tracker.gating_threshold:.0f}px", (960, 32), font, 0.5, gate_color, 1)
+    cv2.putText(
+        bar,
+        f"Gate:{tracker.gating_threshold:.0f}px Rad:{tracker.search_radius:.0f}px",
+        (900, 32),
+        font,
+        0.5,
+        gate_color,
+        1,
+    )
 
     # Progress bar
     prog_x = 1180
@@ -1055,7 +1063,7 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     ctrl_height = 25
     ctrl_bar = np.zeros((ctrl_height, display_width, 3), dtype=np.uint8)
     ctrl_bar[:] = (30, 30, 30)
-    controls = "SPACE:Play/Pause  V:View  U:Update  [ / ]:Gate Thresh  R:Reset  O:Open  S:Settings  +/-:Speed  Q:Quit"
+    controls = "SPACE:Play/Pause  V:View  U:Update  [ / ]:Gate Thresh  , / .:Radius  R:Reset  O:Open  S:Settings  +/-:Speed  Q:Quit"
     cv2.putText(ctrl_bar, controls, (10, 18), font, 0.45, (120, 120, 120), 1)
 
     result = np.vstack([bar, video_combined, ctrl_bar])
@@ -1077,7 +1085,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 
     print(f"FPS: {fps:.1f}, Frames: {total_frames}")
-    print("\nSPACE:Play/Pause V:View U:Update [ / ]:Gate Thresh R:Reset O:Open S:Settings Q:Quit")
+    print("\nSPACE:Play/Pause V:View U:Update [ / ]:Gate Thresh , / .:Radius R:Reset O:Open S:Settings Q:Quit")
 
     display_width = 1200
     min_width = 600
@@ -1215,6 +1223,12 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         elif key == ord('['):
             tracker.gating_threshold = max(10, tracker.gating_threshold - 10)
             print(f"Gating Threshold decreased to: {tracker.gating_threshold}")
+        elif key == ord('.'):
+            tracker.search_radius += 10
+            print(f"Search radius increased to: {tracker.search_radius}")
+        elif key == ord(','):
+            tracker.search_radius = max(50, tracker.search_radius - 10)
+            print(f"Search radius decreased to: {tracker.search_radius}")
         elif key == ord('+') or key == ord('='):
             delay = max(1, delay - 5)
             speed_multiplier = base_delay / delay
