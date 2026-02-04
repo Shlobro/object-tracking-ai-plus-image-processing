@@ -63,7 +63,7 @@ class FeatureBasedTracker:
             maxLevel=4,
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
         )
-        self.base_gating_threshold = 100.0  # Threshold for blocking YOLO updates (pixels)
+        self.base_gating_threshold = 70.0  # Threshold for blocking YOLO updates (pixels)
         self.search_radius = self.base_search_radius
         self.gating_threshold = self.base_gating_threshold
         self.hybrid_update_interval_sec = 2.0
@@ -192,7 +192,8 @@ class FeatureBasedTracker:
             cv2.circle(mask, (cx, cy), 50, 0, -1)
 
         # Try ORB first
-        keypoints = self.orb.detect(gray, mask)
+        # Normalize to list in case OpenCV returns a tuple
+        keypoints = list(self.orb.detect(gray, mask) or [])
 
         # If ORB didn't find enough, use Good Features to Track
         if len(keypoints) < self.num_features:
