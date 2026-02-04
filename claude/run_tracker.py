@@ -64,6 +64,9 @@ class FeatureBasedTracker:
             criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 50, 0.001)
         )
         self.base_gating_threshold = 70.0  # Threshold for blocking YOLO updates (pixels)
+        self.base_motion_outlier_px = 8.0  # Reject points that move too differently from the background
+        self.motion_outlier_px = self.base_motion_outlier_px
+        self.motion_outlier_scale = 2.0
         self.search_radius = self.base_search_radius
         self.gating_threshold = self.base_gating_threshold
         self.hybrid_update_interval_sec = 2.0
@@ -84,6 +87,7 @@ class FeatureBasedTracker:
         self.search_radius = max(1, int(round(self.base_search_radius * self.tracking_scale)))
         self.gating_threshold = max(1.0, float(self.base_gating_threshold * self.tracking_scale))
         self.hybrid_yolo_stable_max_delta = max(1.0, float(self.base_hybrid_yolo_stable_max_delta * self.tracking_scale))
+        self.motion_outlier_px = max(1.0, float(self.base_motion_outlier_px * self.tracking_scale))
 
     def adjust_search_radius(self, delta):
         self.base_search_radius = max(50, self.base_search_radius + delta)
@@ -262,6 +266,8 @@ class FeatureBasedTracker:
         )
 
         h, w = curr_gray.shape
+        good_candidates = []
+        displacements = []
 
         for i, p in enumerate(self.tracked_points):
             new_pt = new_pts[i].ravel()
@@ -272,15 +278,34 @@ class FeatureBasedTracker:
             if status[i][0] == 1 and back_status[i][0] == 1 and in_frame:
                 fb_error = np.linalg.norm(pts[i].ravel() - back_pts[i].ravel())
                 if fb_error < 3.0:  # Good tracking
-                    p['point'] = new_pt
-                    p['lost_count'] = 0
-                    p['age'] += 1
+                    disp = new_pt - pts[i].ravel()
+                    good_candidates.append((p, new_pt, disp))
+                    displacements.append(disp)
                 else:
                     p['lost_count'] += 1
             else:
                 p['lost_count'] += 1
 
-            # Mark as inactive if lost
+        median_disp = None
+        max_dev = None
+        if displacements:
+            disp_array = np.array(displacements)
+            median_disp = np.median(disp_array, axis=0)
+            median_mag = np.median(np.linalg.norm(disp_array, axis=1))
+            max_dev = max(self.motion_outlier_px, self.motion_outlier_scale * max(1.0, median_mag))
+
+        for p, new_pt, disp in good_candidates:
+            if median_disp is not None:
+                dev = np.linalg.norm(disp - median_disp)
+                if dev > max_dev:
+                    p['lost_count'] += 1
+                    continue
+            p['point'] = new_pt
+            p['lost_count'] = 0
+            p['age'] += 1
+
+        # Mark as inactive if lost
+        for p in self.tracked_points:
             if p['lost_count'] > 2:
                 p['active'] = False
                 self.features_lost_total += 1
