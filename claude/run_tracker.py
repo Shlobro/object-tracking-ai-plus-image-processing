@@ -14,6 +14,12 @@ from tkinter import filedialog, messagebox
 TARGET_STREAM_WIDTH = 640
 UI_SCALE = 0.75
 
+FEATURE_ALGO_CLASSIC = "Classic"
+FEATURE_ALGO_SLICE = "Slice-based"
+FEATURE_EXTRACTION_MODES = (FEATURE_ALGO_CLASSIC, FEATURE_ALGO_SLICE)
+MIN_FEATURE_BUDGET = 5
+MAX_FEATURE_BUDGET = 200
+
 
 def compute_tracking_resize(frame_width, frame_height, target_width=TARGET_STREAM_WIDTH):
     if frame_width <= target_width:
@@ -39,12 +45,22 @@ def log_tracking_resize(label, frame_width, frame_height, tracking_width, tracki
 
 
 class FeatureBasedTracker:
-    def __init__(self, model_path, init_frames=5, num_features=30, search_radius=350):
+    def __init__(
+        self,
+        model_path,
+        init_frames=5,
+        num_features=30,
+        search_radius=350,
+        feature_extraction_mode=FEATURE_ALGO_CLASSIC,
+        num_slices=8,
+    ):
         print(f"Loading YOLO model from: {model_path}")
         self.model = YOLO(model_path)
         self.init_frames = init_frames
         self.num_features = num_features
         self.base_search_radius = search_radius
+        self.feature_extraction_mode = FEATURE_ALGO_CLASSIC
+        self.num_slices = max(1, int(num_slices))
         self.tracking_scale = 1.0
 
         # Use ORB - faster and often finds more features than SIFT in textured areas
@@ -77,8 +93,20 @@ class FeatureBasedTracker:
         self.hybrid_yolo_stable_frames = 3
         self.fps = 30.0
         self.hybrid_update_interval_frames = max(1, int(round(self.hybrid_update_interval_sec * self.fps)))
+        self.set_feature_extraction_mode(feature_extraction_mode)
         self.apply_tracking_scale(self.tracking_scale)
         self.reset()
+
+    def set_feature_extraction_mode(self, mode):
+        if mode not in FEATURE_EXTRACTION_MODES:
+            mode = FEATURE_ALGO_CLASSIC
+        self.feature_extraction_mode = mode
+        return self.feature_extraction_mode
+
+    def toggle_feature_extraction_mode(self):
+        if self.feature_extraction_mode == FEATURE_ALGO_CLASSIC:
+            return self.set_feature_extraction_mode(FEATURE_ALGO_SLICE)
+        return self.set_feature_extraction_mode(FEATURE_ALGO_CLASSIC)
 
     def apply_tracking_scale(self, scale):
         if not scale or scale <= 0:
@@ -171,82 +199,185 @@ class FeatureBasedTracker:
             return center, best_box, best_conf
         return None, None, 0
 
-    def find_features_around_point(self, gray, center, bbox=None):
-        """Find stable feature points around a center point."""
-        h, w = gray.shape
+    def _build_annulus_mask(self, gray_shape, center, bbox=None):
+        h, w = gray_shape
         cx, cy = int(center[0]), int(center[1])
-
-        # Create search mask - ring around center
         mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.circle(mask, (cx, cy), self.search_radius, 255, -1)
 
-        # Large outer radius for searching
-        outer_radius = self.search_radius
-        cv2.circle(mask, (cx, cy), outer_radius, 255, -1)
-
-        # If we have bbox, exclude the object area
         if bbox is not None:
             x1, y1, x2, y2 = map(int, bbox)
             margin = 20
-            cv2.rectangle(mask,
-                          (max(0, x1 - margin), max(0, y1 - margin)),
-                          (min(w, x2 + margin), min(h, y2 + margin)),
-                          0, -1)
+            cv2.rectangle(
+                mask,
+                (max(0, x1 - margin), max(0, y1 - margin)),
+                (min(w - 1, x2 + margin), min(h - 1, y2 + margin)),
+                0,
+                -1,
+            )
         else:
-            # Exclude small area around center
             cv2.circle(mask, (cx, cy), 50, 0, -1)
 
-        # Try ORB first
-        # Normalize to list in case OpenCV returns a tuple
+        return mask
+
+    def _detect_candidates(self, gray, mask, requested_points):
+        candidates = []
+
         keypoints = list(self.orb.detect(gray, mask) or [])
-
-        # If ORB didn't find enough, use Good Features to Track
-        if len(keypoints) < self.num_features:
-            corners = cv2.goodFeaturesToTrack(gray, mask=mask, **self.gftt_params)
-            if corners is not None:
-                for corner in corners:
-                    pt = corner.ravel()
-                    # Create a fake keypoint
-                    kp = cv2.KeyPoint(pt[0], pt[1], 10)
-                    keypoints.append(kp)
-
-        if not keypoints:
-            return []
-
-        # Sort by response and take best ones, but spread them out
-        keypoints = sorted(keypoints, key=lambda k: k.response if hasattr(k, 'response') and k.response else 0, reverse=True)
-
-        # Select features that are well distributed
-        selected_points = []
-        min_dist_between = 30  # Minimum distance between features
-
         for kp in keypoints:
-            pt = np.array([kp.pt[0], kp.pt[1]], dtype=np.float32)
+            response = kp.response if hasattr(kp, "response") and kp.response is not None else 0.0
+            candidates.append(
+                {
+                    "point": np.array([kp.pt[0], kp.pt[1]], dtype=np.float32),
+                    "response": float(response),
+                }
+            )
 
-            # Check distance from already selected points
+        gftt_params = dict(self.gftt_params)
+        gftt_params["maxCorners"] = max(10, int(max(requested_points * 3, requested_points)))
+        corners = cv2.goodFeaturesToTrack(gray, mask=mask, **gftt_params)
+        if corners is not None:
+            for corner in corners:
+                pt = corner.ravel()
+                candidates.append(
+                    {
+                        "point": np.array([pt[0], pt[1]], dtype=np.float32),
+                        "response": 0.0,
+                    }
+                )
+
+        candidates.sort(key=lambda c: c["response"], reverse=True)
+        return candidates
+
+    def _deduplicate_candidates(self, candidates, min_distance, max_points=None):
+        selected = []
+        min_distance = float(min_distance)
+        for candidate in candidates:
+            pt = candidate["point"]
             too_close = False
-            for existing in selected_points:
-                if np.linalg.norm(pt - existing['point']) < min_dist_between:
+            for existing in selected:
+                if np.linalg.norm(pt - existing["point"]) < min_distance:
                     too_close = True
                     break
+            if too_close:
+                continue
 
-            if not too_close:
-                direction = np.array(center) - pt
-                dist = np.linalg.norm(direction)
-                if dist > 10:  # Avoid points too close to center
-                    direction = direction / dist
-                    selected_points.append({
-                        'point': pt,
-                        'direction': direction,
-                        'distance': dist,
-                        'active': True,
-                        'lost_count': 0,
-                        'age': 0
-                    })
+            selected.append(candidate)
+            if max_points is not None and len(selected) >= max_points:
+                break
+        return selected
 
+    def _candidates_to_features(self, candidates, center):
+        center_arr = np.array(center, dtype=np.float32)
+        selected_points = []
+        for candidate in candidates:
+            pt = candidate["point"]
+            direction = center_arr - pt
+            dist = np.linalg.norm(direction)
+            if dist <= 10:
+                continue
+            selected_points.append(
+                {
+                    "point": pt,
+                    "direction": direction / dist,
+                    "distance": dist,
+                    "active": True,
+                    "lost_count": 0,
+                    "age": 0,
+                }
+            )
             if len(selected_points) >= self.num_features:
                 break
-
         return selected_points
+
+    def _prune_tracked_points_to_budget(self):
+        if len(self.tracked_points) <= self.num_features:
+            return 0
+
+        ranked = sorted(
+            self.tracked_points,
+            key=lambda p: (
+                1 if p.get('active', False) else 0,
+                -int(p.get('lost_count', 0)),
+                int(p.get('age', 0)),
+            ),
+            reverse=True,
+        )
+        removed = max(0, len(ranked) - self.num_features)
+        self.tracked_points = ranked[:self.num_features]
+        return removed
+
+    def adjust_feature_budget(self, delta, min_budget=MIN_FEATURE_BUDGET, max_budget=MAX_FEATURE_BUDGET):
+        old_budget = int(self.num_features)
+        new_budget = max(int(min_budget), min(int(max_budget), old_budget + int(delta)))
+        self.num_features = new_budget
+        removed = self._prune_tracked_points_to_budget()
+        return old_budget, new_budget, removed
+
+    def _find_features_classic(self, gray, center, bbox=None):
+        mask = self._build_annulus_mask(gray.shape, center, bbox)
+        candidates = self._detect_candidates(gray, mask, self.num_features)
+        if not candidates:
+            return []
+        selected = self._deduplicate_candidates(candidates, min_distance=30, max_points=self.num_features)
+        return self._candidates_to_features(selected, center)
+
+    def _find_features_slice_based(self, gray, center, bbox=None):
+        h, w = gray.shape
+        cx, cy = int(center[0]), int(center[1])
+        base_mask = self._build_annulus_mask(gray.shape, center, bbox)
+        num_slices = max(1, int(self.num_slices))
+        features_per_slice = int(np.ceil(self.num_features / float(num_slices)))
+        if features_per_slice <= 0:
+            return []
+
+        all_candidates = []
+        slice_angle = 360.0 / float(num_slices)
+        for slice_idx in range(num_slices):
+            start_angle = slice_idx * slice_angle
+            end_angle = (slice_idx + 1) * slice_angle
+
+            wedge_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(
+                wedge_mask,
+                (cx, cy),
+                (self.search_radius, self.search_radius),
+                0,
+                start_angle,
+                end_angle,
+                255,
+                -1,
+            )
+
+            slice_mask = cv2.bitwise_and(base_mask, wedge_mask)
+            if cv2.countNonZero(slice_mask) == 0:
+                continue
+
+            slice_candidates = self._detect_candidates(gray, slice_mask, features_per_slice)
+            if not slice_candidates:
+                continue
+
+            slice_selected = self._deduplicate_candidates(
+                slice_candidates,
+                min_distance=5,
+                max_points=features_per_slice,
+            )
+            all_candidates.extend(slice_selected)
+
+        if not all_candidates:
+            return []
+
+        all_candidates.sort(key=lambda c: c["response"], reverse=True)
+        global_selected = self._deduplicate_candidates(all_candidates, min_distance=5, max_points=None)
+        if len(global_selected) > self.num_features:
+            global_selected = global_selected[: self.num_features]
+        return self._candidates_to_features(global_selected, center)
+
+    def find_features_around_point(self, gray, center, bbox=None):
+        """Find stable feature points around a center point."""
+        if self.feature_extraction_mode == FEATURE_ALGO_SLICE:
+            return self._find_features_slice_based(gray, center, bbox)
+        return self._find_features_classic(gray, center, bbox)
 
     def track_points_optical_flow(self, prev_gray, curr_gray):
         """Track feature points using Lucas-Kanade optical flow."""
@@ -313,9 +444,12 @@ class FeatureBasedTracker:
         # Remove inactive points
         self.tracked_points = [p for p in self.tracked_points if p['active']]
 
-    def add_new_features(self, gray, estimated_center):
+    def add_new_features(self, gray, estimated_center, force=False):
         """Add new features if we're running low."""
-        if len(self.tracked_points) >= self.num_features // 2:
+        if estimated_center is None:
+            return
+
+        if (not force) and len(self.tracked_points) >= self.num_features // 2:
             return  # We have enough
 
         # Find new features around estimated center
@@ -534,11 +668,13 @@ class FeatureBasedTracker:
         return {
             'frame': self.frame_count,
             'active_features': active,
+            'target_features': self.num_features,
             'total_features': len(self.tracked_points),
             'intersections': self.intersections_used,
             'avg_error': avg_error,
             'current_error': current_error,
-            'is_init': not self.initialized
+            'is_init': not self.initialized,
+            'feature_mode': self.feature_extraction_mode,
         }
 
 
@@ -644,7 +780,13 @@ class TrackingConfigDialog:
         self.default_dir = default_dir
         self.result = None
 
-    def select(self, default_video_path=None, default_mode=None, default_tracker=None):
+    def select(
+        self,
+        default_video_path=None,
+        default_mode=None,
+        default_tracker=None,
+        default_feature_mode=None,
+    ):
         root = tk.Tk()
         root.title("Tracking Settings")
         root.resizable(False, False)
@@ -654,10 +796,13 @@ class TrackingConfigDialog:
             default_mode = TRACKING_MODE_FEATURE
         if default_tracker not in ULTRALYTICS_TRACKERS:
             default_tracker = "ByteTrack"
+        if default_feature_mode not in FEATURE_EXTRACTION_MODES:
+            default_feature_mode = FEATURE_ALGO_CLASSIC
 
         video_var = tk.StringVar(value=default_video_path)
         mode_var = tk.StringVar(value=default_mode)
         tracker_var = tk.StringVar(value=default_tracker)
+        feature_mode_var = tk.StringVar(value=default_feature_mode)
 
         def browse():
             path = filedialog.askopenfilename(
@@ -672,10 +817,13 @@ class TrackingConfigDialog:
                 video_var.set(path)
 
         def update_tracker_state(*_):
-            if mode_var.get() == TRACKING_MODE_ULTRA:
+            current_mode = mode_var.get()
+            if current_mode == TRACKING_MODE_ULTRA:
                 tracker_menu.configure(state="normal")
+                feature_mode_menu.configure(state="disabled")
             else:
                 tracker_menu.configure(state="disabled")
+                feature_mode_menu.configure(state="normal")
 
         def on_ok():
             path = video_var.get().strip()
@@ -686,6 +834,7 @@ class TrackingConfigDialog:
                 "video_path": path,
                 "mode": mode_var.get(),
                 "tracker": tracker_var.get(),
+                "feature_mode": feature_mode_var.get(),
             }
             root.destroy()
 
@@ -707,13 +856,18 @@ class TrackingConfigDialog:
         mode_menu.config(width=24)
         mode_menu.grid(row=3, column=0, columnspan=2, sticky="w", pady=(4, 6))
 
-        tk.Label(container, text="Ultralytics tracker:").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        tk.Label(container, text="Feature extraction:").grid(row=4, column=0, sticky="w", pady=(4, 0))
+        feature_mode_menu = tk.OptionMenu(container, feature_mode_var, *FEATURE_EXTRACTION_MODES)
+        feature_mode_menu.config(width=24)
+        feature_mode_menu.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 6))
+
+        tk.Label(container, text="Ultralytics tracker:").grid(row=6, column=0, sticky="w", pady=(4, 0))
         tracker_menu = tk.OptionMenu(container, tracker_var, *ULTRALYTICS_TRACKERS.keys())
         tracker_menu.config(width=24)
-        tracker_menu.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 10))
+        tracker_menu.grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 10))
 
         buttons = tk.Frame(container)
-        buttons.grid(row=6, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=8, column=0, columnspan=3, sticky="e")
         tk.Button(buttons, text="Cancel", command=on_cancel).grid(row=0, column=0, padx=(0, 6))
         tk.Button(buttons, text="OK", command=on_ok).grid(row=0, column=1)
 
@@ -1144,15 +1298,17 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
 
     # Features - more prominent
     feat_count = stats['active_features']
-    if feat_count >= 15:
+    target_feat_count = max(1, int(stats.get('target_features', tracker.num_features)))
+    feat_ratio = feat_count / float(target_feat_count)
+    if feat_ratio >= 0.8:
         fc = (0, 255, 0)
-    elif feat_count >= 8:
+    elif feat_ratio >= 0.5:
         fc = (0, 255, 255)
-    elif feat_count >= 3:
+    elif feat_ratio >= 0.25:
         fc = (0, 165, 255)
     else:
         fc = (0, 0, 255)
-    cv2.putText(bar, f"Feat:{feat_count}", (360, 32), font, 0.7, fc, 2)
+    cv2.putText(bar, f"Feat:{feat_count}/{target_feat_count}", (360, 32), font, 0.7, fc, 2)
 
     # Intersections
     cv2.putText(bar, f"Int:{stats['intersections']}", (480, 32), font, 0.6, (255, 255, 0), 1)
@@ -1176,14 +1332,15 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     view_color = (255, 255, 0)
     if view_mode == 3:
         view_color = (0, 255, 0) if using_yolo else (0, 165, 255)
-    cv2.putText(bar, f"V:{view_names[view_mode]}", (770, 32), font, 0.6, view_color, 1)
+    algo_short = "SLC" if tracker.feature_extraction_mode == FEATURE_ALGO_SLICE else "CLS"
+    cv2.putText(bar, f"V:{view_names[view_mode]} A:{algo_short}", (760, 32), font, 0.5, view_color, 1)
 
     # Update mode indicator & Gating Status
     upd_text = "UPD:ON" if update_features_with_yolo else "UPD:OFF"
     upd_color = (0, 255, 0) if update_features_with_yolo else (100, 100, 100)
     src_text = "SRC:DS" if show_tracking_view else "SRC:ORIG"
-    cv2.putText(bar, src_text, (840, 32), font, 0.5, (180, 180, 180), 1)
-    cv2.putText(bar, upd_text, (930, 32), font, 0.5, upd_color, 1)
+    cv2.putText(bar, src_text, (875, 32), font, 0.5, (180, 180, 180), 1)
+    cv2.putText(bar, upd_text, (960, 32), font, 0.5, upd_color, 1)
     
     # Gating Threshold + Search Radius
     gate_color = (0, 255, 255)
@@ -1194,7 +1351,7 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     cv2.putText(
         bar,
         f"Gate:{tracker.base_gating_threshold:.0f}px Rad:{tracker.base_search_radius:.0f}px",
-        (1000, 32),
+        (1030, 32),
         font,
         0.5,
         gate_color,
@@ -1213,17 +1370,23 @@ def create_display(yolo_vis, feature_vis, tracker, yolo_conf, total_frames, is_p
     ctrl_height = 25
     ctrl_bar = np.zeros((ctrl_height, display_width, 3), dtype=np.uint8)
     ctrl_bar[:] = (30, 30, 30)
-    controls = "SPACE:Play/Pause  V:View  U:Update  D:Downscale  [ / ]:Gate Thresh  , / .:Radius  R:Reset  O:Open  S:Settings  +/-:Speed  Q:Quit"
+    controls = "SPACE:Play/Pause  V:View  U:Update  M:FeatMode  N:+Feat  B:-Feat  D:Downscale  [ / ]:Gate  , / .:Radius  R:Reset  O:Open  S:Settings  +/-:Speed  Q:Quit"
     cv2.putText(ctrl_bar, controls, (10, 18), font, 0.45, (120, 120, 120), 1)
 
     result = np.vstack([bar, video_combined, ctrl_bar])
     return result
 
 
-def run_feature_tracking(video_path, model_path, selector, config_dialog, tracker_choice):
+def run_feature_tracking(video_path, model_path, selector, config_dialog, tracker_choice, feature_mode=FEATURE_ALGO_CLASSIC):
     print(f"Video: {os.path.basename(video_path)}")
 
-    tracker = FeatureBasedTracker(model_path, init_frames=5, num_features=30, search_radius=350)
+    tracker = FeatureBasedTracker(
+        model_path,
+        init_frames=5,
+        num_features=30,
+        search_radius=350,
+        feature_extraction_mode=feature_mode,
+    )
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -1241,7 +1404,8 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
     log_tracking_resize("Tracking input", frame_width, frame_height, tracking_width, tracking_height, tracking_scale)
 
     print(f"FPS: {fps:.1f}, Frames: {total_frames}")
-    print("\nSPACE:Play/Pause V:View U:Update D:Downscale [ / ]:Gate Thresh , / .:Radius R:Reset O:Open S:Settings Q:Quit")
+    print(f"Feature extraction mode: {tracker.feature_extraction_mode}")
+    print("\nSPACE:Play/Pause V:View U:Update M:FeatMode N:+Feat B:-Feat D:Downscale [ / ]:Gate Thresh , / .:Radius R:Reset O:Open S:Settings Q:Quit")
 
     display_width = 1200
     min_width = 600
@@ -1293,6 +1457,29 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         last_yolo_vis = draw_yolo_view(base_frame, last_yolo_center, last_yolo_bbox, last_yolo_conf, view_scale, coord_scale)
         last_feature_vis = draw_feature_view(base_frame, tracker, last_feature_center, last_yolo_center, last_yolo_bbox, last_is_init, view_scale, coord_scale)
         last_hybrid_vis, last_using_yolo = draw_hybrid_view(base_frame, last_memory_center, last_yolo_center, view_scale, last_is_gated, coord_scale)
+
+    def adjust_features_live(delta):
+        old_budget, new_budget, removed = tracker.adjust_feature_budget(delta)
+        if new_budget == old_budget:
+            print(f"Feature budget unchanged ({new_budget})")
+            return
+
+        if delta > 0 and last_tracking_frame is not None:
+            seed_center = last_feature_center
+            if seed_center is None:
+                seed_center = last_yolo_center
+            if seed_center is None:
+                seed_center = tracker.memory_center
+            if seed_center is not None:
+                gray_seed = cv2.cvtColor(last_tracking_frame, cv2.COLOR_BGR2GRAY)
+                tracker.add_new_features(gray_seed, seed_center, force=True)
+
+        active_now = sum(1 for p in tracker.tracked_points if p['active'] and p['lost_count'] == 0)
+        if removed > 0:
+            print(f"Feature budget: {new_budget} (active {active_now}, removed {removed})")
+        else:
+            print(f"Feature budget: {new_budget} (active {active_now})")
+        render_views()
 
     ret, frame = cap.read()
     if ret:
@@ -1350,6 +1537,13 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
         elif key == ord('u'):
             update_features_with_yolo = not update_features_with_yolo
             print(f"Update features with YOLO: {'ON' if update_features_with_yolo else 'OFF'}")
+        elif key == ord('m'):
+            new_mode = tracker.toggle_feature_extraction_mode()
+            print(f"Feature extraction mode: {new_mode}")
+        elif key == ord('n') or key == ord('N'):
+            adjust_features_live(+5)
+        elif key == ord('b') or key == ord('B'):
+            adjust_features_live(-5)
         elif key == ord('d'):
             show_tracking_view = not show_tracking_view
             print(f"Display source: {'DOWNSCALED' if show_tracking_view else 'ORIGINAL'}")
@@ -1413,6 +1607,7 @@ def run_feature_tracking(video_path, model_path, selector, config_dialog, tracke
                 default_video_path=video_path,
                 default_mode=TRACKING_MODE_FEATURE,
                 default_tracker=tracker_choice,
+                default_feature_mode=tracker.feature_extraction_mode,
             )
             if selection:
                 next_selection = selection
@@ -1578,6 +1773,7 @@ def run_ultralytics_tracking(video_path, model_path, tracker_yaml, tracker_label
                 default_video_path=video_path,
                 default_mode=TRACKING_MODE_ULTRA,
                 default_tracker=tracker_label,
+                default_feature_mode=FEATURE_ALGO_CLASSIC,
             )
             if selection:
                 next_selection = selection
@@ -1640,6 +1836,7 @@ def main():
         video_path = selection["video_path"]
         tracking_mode = selection["mode"]
         tracker_choice = selection["tracker"]
+        feature_mode = selection.get("feature_mode", FEATURE_ALGO_CLASSIC)
 
         if tracking_mode == TRACKING_MODE_ULTRA:
             tracker_yaml = get_active_tracker_path(script_dir, tracker_choice)
@@ -1648,8 +1845,15 @@ def main():
                 video_path, model_path, tracker_yaml, tracker_choice, selector, config_dialog, script_dir
             )
         else:
-            print(f"Tracking mode: {tracking_mode}")
-            selection = run_feature_tracking(video_path, model_path, selector, config_dialog, tracker_choice)
+            print(f"Tracking mode: {tracking_mode} ({feature_mode})")
+            selection = run_feature_tracking(
+                video_path,
+                model_path,
+                selector,
+                config_dialog,
+                tracker_choice,
+                feature_mode,
+            )
 
 
 if __name__ == "__main__":
